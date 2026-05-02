@@ -15,7 +15,7 @@ app = FastAPI(
 )
 
 frontend_origins = [
-    origin.strip()
+    origin.strip().rstrip("/")
     for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",")
     if origin.strip()
 ]
