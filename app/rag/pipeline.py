@@ -1,10 +1,12 @@
 import os
+import time
 from pathlib import Path
 from urllib.parse import quote
 from urllib import request
 from urllib.error import HTTPError, URLError
 from dotenv import load_dotenv
 from fastapi import UploadFile
+from app.observability import log_observability, new_trace_id
 from app.rag.processor import extract_text_from_pdf, chunk_text
 from app.storage.vector_store import VectorStore
 from app.rag.prompt import build_prompt
@@ -119,6 +121,10 @@ def _iter_gemini_sse(path: str, payload: dict, timeout: int = 180):
 
 def _effective_gemini_model() -> str:
     return "gemini-2.5-flash" if GEMINI_MODEL == "gemini-1.5-flash" else GEMINI_MODEL
+
+
+def get_model_name() -> str:
+    return _effective_gemini_model()
 
 
 def _extract_response_text(response: dict) -> str:
@@ -293,6 +299,16 @@ def _dedupe_source_items(sources: list[dict]) -> list[dict]:
     return unique_sources[:5]
 
 
+def _source_summary(chunks: list[dict]) -> list[dict]:
+    return [
+        {
+            "page": chunk.get("page"),
+            "snippet": chunk.get("text", "")[:180],
+        }
+        for chunk in chunks
+    ]
+
+
 def _normalize_response(response: dict, retrieved_chunks: list[dict]) -> dict:
     response.setdefault("answer", "")
     response.setdefault("key_insights", [])
@@ -353,6 +369,10 @@ def _parse_llm_json(raw_output: str, retrieved_chunks: list[dict]) -> dict:
     return _fallback_response(raw_output, retrieved_chunks)
 
 
+def parse_llm_json(raw_output: str, retrieved_chunks: list[dict]) -> dict:
+    return _parse_llm_json(raw_output, retrieved_chunks)
+
+
 def _build_general_chat_prompt(
     message: str,
     history: list[dict] | None = None,
@@ -399,7 +419,32 @@ def _retrieve_chat_context(message: str, limit: int = 3) -> list[dict]:
     return _limit_chunks(retrieved_chunks, limit=limit, max_chars=600)
 
 
+def retrieve_rag_context(query: str) -> tuple[list[dict], dict]:
+    query_embedding = embed_texts_gemini([query], task_type="RETRIEVAL_QUERY")[0]
+    _ensure_vector_store_dim(len(query_embedding))
+
+    initial_chunks = vector_store.search(query_embedding, k=RETRIEVAL_CANDIDATES)
+    reranked_chunks = [chunk for _, chunk in _rerank_chunks(query, initial_chunks)]
+    unique_chunks = _dedupe_chunks(reranked_chunks)
+    limited_chunks = _limit_chunks(unique_chunks)
+
+    return limited_chunks, {
+        "requested_candidates": RETRIEVAL_CANDIDATES,
+        "initial_count": len(initial_chunks),
+        "deduped_count": len(unique_chunks),
+        "returned_count": len(limited_chunks),
+        "source_pages": [
+            chunk.get("page")
+            for chunk in limited_chunks
+            if chunk.get("page") is not None
+        ],
+        "sources": _source_summary(limited_chunks),
+    }
+
+
 async def process_document(file: UploadFile):
+    trace_id = new_trace_id()
+    started = time.perf_counter()
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     filename = Path(file.filename or "uploaded.pdf").name
     file_path = os.path.join(UPLOAD_DIR, filename)
@@ -407,47 +452,85 @@ async def process_document(file: UploadFile):
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
+    processing_started = time.perf_counter()
     text_data = extract_text_from_pdf(file_path)
     chunks = chunk_text(text_data)
+    processing_latency_ms = round((time.perf_counter() - processing_started) * 1000, 2)
 
     texts = [c["text"] for c in chunks]
+    embedding_started = time.perf_counter()
     embeddings = embed_texts_gemini(texts, task_type="RETRIEVAL_DOCUMENT")
+    embedding_latency_ms = round((time.perf_counter() - embedding_started) * 1000, 2)
 
     if not embeddings:
+        log_observability("document_upload", {
+            "trace_id": trace_id,
+            "filename": filename,
+            "chunks": 0,
+            "latency_ms": {
+                "processing": processing_latency_ms,
+                "embedding": embedding_latency_ms,
+                "total": round((time.perf_counter() - started) * 1000, 2),
+            },
+        })
         return {"chunks": 0}
 
     _reset_vector_store(len(embeddings[0]))
     vector_store.add(embeddings, chunks)
     vector_store.save()
 
+    log_observability("document_upload", {
+        "trace_id": trace_id,
+        "filename": filename,
+        "pages": len(text_data),
+        "chunks": len(chunks),
+        "embedding_model": GEMINI_EMBEDDING_MODEL,
+        "latency_ms": {
+            "processing": processing_latency_ms,
+            "embedding": embedding_latency_ms,
+            "total": round((time.perf_counter() - started) * 1000, 2),
+        },
+    })
+
     return {"chunks": len(chunks)}
 
 
 async def query_rag(query: str):
-    query_embedding = embed_texts_gemini([query], task_type="RETRIEVAL_QUERY")[0]
-    _ensure_vector_store_dim(len(query_embedding))
-
-    retrieved_chunks = vector_store.search(query_embedding, k=RETRIEVAL_CANDIDATES)
-    retrieved_chunks = [chunk for _, chunk in _rerank_chunks(query, retrieved_chunks)]
-    retrieved_chunks = _dedupe_chunks(retrieved_chunks)
-    retrieved_chunks = _limit_chunks(retrieved_chunks)
+    trace_id = new_trace_id()
+    started = time.perf_counter()
+    retrieval_started = time.perf_counter()
+    retrieved_chunks, retrieval_metrics = retrieve_rag_context(query)
+    retrieval_latency_ms = round((time.perf_counter() - retrieval_started) * 1000, 2)
 
     prompt = build_prompt(retrieved_chunks, query)
 
-    print(f"query: {query}")
-    print(f"retrieved_chunks: {len(retrieved_chunks)}")
-    print(f"prompt_length: {len(prompt)}")
-
+    llm_started = time.perf_counter()
     raw_output = call_gemini_llm(
         prompt,
         response_mime_type="application/json",
         response_schema=RESPONSE_SCHEMA,
         max_output_tokens=2048,
     )
+    llm_latency_ms = round((time.perf_counter() - llm_started) * 1000, 2)
 
-    print(f"response_length: {len(raw_output)}")
+    response = _parse_llm_json(raw_output, retrieved_chunks)
 
-    return _parse_llm_json(raw_output, retrieved_chunks)
+    log_observability("rag_query", {
+        "trace_id": trace_id,
+        "model": _effective_gemini_model(),
+        "query": query,
+        "prompt": prompt,
+        "prompt_length": len(prompt),
+        "response_length": len(raw_output),
+        "retrieval": retrieval_metrics,
+        "latency_ms": {
+            "retrieval": retrieval_latency_ms,
+            "llm": llm_latency_ms,
+            "total": round((time.perf_counter() - started) * 1000, 2),
+        },
+    })
+
+    return response
 
 
 async def chat_with_assistant(
@@ -455,34 +538,55 @@ async def chat_with_assistant(
     history: list[dict] | None = None,
     use_knowledge_base: bool = True,
 ) -> dict:
+    trace_id = new_trace_id()
+    started = time.perf_counter()
     retrieved_chunks = []
+    retrieval_latency_ms = 0.0
 
     if use_knowledge_base:
+        retrieval_started = time.perf_counter()
         retrieved_chunks = _retrieve_chat_context(message)
+        retrieval_latency_ms = round((time.perf_counter() - retrieval_started) * 1000, 2)
 
     prompt = _build_general_chat_prompt(message, history, retrieved_chunks)
 
-    print(f"chat_message: {message}")
-    print(f"chat_context_chunks: {len(retrieved_chunks)}")
-    print(f"chat_prompt_length: {len(prompt)}")
-
+    llm_started = time.perf_counter()
     answer = call_gemini_llm(
         prompt,
         response_mime_type="text/plain",
         max_output_tokens=1200,
     )
+    llm_latency_ms = round((time.perf_counter() - llm_started) * 1000, 2)
 
-    print(f"chat_response_length: {len(answer)}")
+    log_observability("chat", {
+        "trace_id": trace_id,
+        "model": _effective_gemini_model(),
+        "message": message,
+        "history_count": len(history or []),
+        "use_knowledge_base": use_knowledge_base,
+        "used_knowledge_base": bool(retrieved_chunks),
+        "prompt": prompt,
+        "prompt_length": len(prompt),
+        "response_length": len(answer),
+        "retrieval": {
+            "returned_count": len(retrieved_chunks),
+            "source_pages": [
+                chunk.get("page")
+                for chunk in retrieved_chunks
+                if chunk.get("page") is not None
+            ],
+            "sources": _source_summary(retrieved_chunks),
+        },
+        "latency_ms": {
+            "retrieval": retrieval_latency_ms,
+            "llm": llm_latency_ms,
+            "total": round((time.perf_counter() - started) * 1000, 2),
+        },
+    })
 
     return {
         "answer": answer.strip(),
-        "sources": [
-            {
-                "page": chunk.get("page"),
-                "snippet": chunk.get("text", "")[:180],
-            }
-            for chunk in retrieved_chunks
-        ],
+        "sources": _source_summary(retrieved_chunks),
         "used_knowledge_base": bool(retrieved_chunks),
         "model": _effective_gemini_model(),
     }
@@ -493,35 +597,58 @@ def stream_chat_with_assistant(
     history: list[dict] | None = None,
     use_knowledge_base: bool = True,
 ):
+    trace_id = new_trace_id()
+    started = time.perf_counter()
+    retrieval_started = time.perf_counter()
     retrieved_chunks = _retrieve_chat_context(message) if use_knowledge_base else []
+    retrieval_latency_ms = round((time.perf_counter() - retrieval_started) * 1000, 2)
     prompt = _build_general_chat_prompt(message, history, retrieved_chunks)
-
-    print(f"stream_chat_message: {message}")
-    print(f"stream_chat_context_chunks: {len(retrieved_chunks)}")
-    print(f"stream_chat_prompt_length: {len(prompt)}")
 
     yield {
         "type": "metadata",
+        "trace_id": trace_id,
         "model": _effective_gemini_model(),
         "used_knowledge_base": bool(retrieved_chunks),
-        "sources": [
-            {
-                "page": chunk.get("page"),
-                "snippet": chunk.get("text", "")[:180],
-            }
-            for chunk in retrieved_chunks
-        ],
+        "sources": _source_summary(retrieved_chunks),
     }
 
     response_length = 0
+    llm_started = time.perf_counter()
     for token in call_gemini_llm_stream(prompt):
         response_length += len(token)
         yield {
             "type": "token",
             "content": token,
         }
+    llm_latency_ms = round((time.perf_counter() - llm_started) * 1000, 2)
 
-    print(f"stream_chat_response_length: {response_length}")
+    log_observability("chat_stream", {
+        "trace_id": trace_id,
+        "model": _effective_gemini_model(),
+        "message": message,
+        "history_count": len(history or []),
+        "use_knowledge_base": use_knowledge_base,
+        "used_knowledge_base": bool(retrieved_chunks),
+        "prompt": prompt,
+        "prompt_length": len(prompt),
+        "response_length": response_length,
+        "retrieval": {
+            "returned_count": len(retrieved_chunks),
+            "source_pages": [
+                chunk.get("page")
+                for chunk in retrieved_chunks
+                if chunk.get("page") is not None
+            ],
+            "sources": _source_summary(retrieved_chunks),
+        },
+        "latency_ms": {
+            "retrieval": retrieval_latency_ms,
+            "llm_stream": llm_latency_ms,
+            "total": round((time.perf_counter() - started) * 1000, 2),
+        },
+    })
+
     yield {
         "type": "done",
+        "trace_id": trace_id,
     }

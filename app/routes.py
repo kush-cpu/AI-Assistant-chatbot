@@ -5,6 +5,12 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.evaluation import compare_prompts, get_prompt_variants
+from app.observability import (
+    get_evaluation_events,
+    get_metrics_summary,
+    get_observability_events,
+)
 from app.rag.pipeline import (
     chat_with_assistant,
     process_document,
@@ -28,6 +34,11 @@ class ChatRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
+
+
+class EvaluationRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    variants: list[str] | None = None
 
 
 def _base_url(request: Request) -> str:
@@ -73,6 +84,9 @@ def root(request: Request):
             "ask_document": f"{api_base_url}/rag/query",
             "chat": f"{api_base_url}/chat",
             "chat_stream": f"{api_base_url}/chat/stream",
+            "observability": f"{api_base_url}/observability/events",
+            "evaluation_metrics": f"{api_base_url}/evaluation/metrics",
+            "prompt_comparison": f"{api_base_url}/evaluation/prompt-comparison",
         },
     }
 
@@ -128,6 +142,30 @@ def capabilities(request: Request):
                     {"type": "token", "content": "partial text"},
                     {"type": "done"},
                 ],
+            },
+            {
+                "name": "Observability events",
+                "method": "GET",
+                "url": f"{api_base_url}/observability/events",
+                "query": {
+                    "limit": 50,
+                    "event_type": "rag_query | chat | chat_stream | document_upload",
+                },
+            },
+            {
+                "name": "Evaluation metrics",
+                "method": "GET",
+                "url": f"{api_base_url}/evaluation/metrics",
+                "query": {"limit": 50},
+            },
+            {
+                "name": "Prompt comparison",
+                "method": "POST",
+                "url": f"{api_base_url}/evaluation/prompt-comparison",
+                "body": {
+                    "question": "Question to evaluate against the uploaded document",
+                    "variants": ["baseline", "concise", "risk_first"],
+                },
             },
         ],
     }
@@ -193,6 +231,43 @@ async def chat_stream(payload: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/api/v1/observability/events")
+async def observability_events(limit: int = 50, event_type: str | None = None):
+    return {
+        "events": get_observability_events(limit=limit, event_type=event_type),
+    }
+
+
+@router.get("/api/v1/evaluation/variants")
+async def evaluation_variants():
+    return {
+        "variants": get_prompt_variants(),
+    }
+
+
+@router.get("/api/v1/evaluation/runs")
+async def evaluation_runs(limit: int = 20):
+    return {
+        "runs": get_evaluation_events(limit=limit),
+    }
+
+
+@router.get("/api/v1/evaluation/metrics")
+async def evaluation_metrics(limit: int = 50):
+    return get_metrics_summary(limit=limit)
+
+
+@router.post("/api/v1/evaluation/prompt-comparison")
+async def prompt_comparison(payload: EvaluationRequest):
+    try:
+        return compare_prompts(
+            question=payload.question,
+            variants=payload.variants,
+        )
+    except Exception as exc:
+        _handle_error(exc, "Prompt comparison")
 
 
 @router.post("/upload")

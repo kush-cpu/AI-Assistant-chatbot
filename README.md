@@ -66,6 +66,8 @@ app/storage/vector_store.py
 - Structured RAG answers with citations, key insights, risks, and recommendations.
 - General assistant chat with optional knowledge-base retrieval.
 - SSE streaming endpoint for frontend token-by-token style responses.
+- Server-side observability logs for retrieval, prompts, and latency.
+- Prompt-comparison evaluation endpoint with groundedness metrics.
 - CORS support for Lovable or any external frontend.
 - Railway deployment support through `Procfile`.
 - Legacy `/upload` and `/query` routes for older clients.
@@ -349,6 +351,189 @@ Possible event types:
 
 This is the main endpoint used by the Lovable frontend for live assistant responses.
 
+### Observability Events
+
+```http
+GET /api/v1/observability/events?limit=50
+```
+
+Optional filter:
+
+```http
+GET /api/v1/observability/events?event_type=rag_query
+```
+
+Supported event types:
+
+- `document_upload`
+- `rag_query`
+- `chat`
+- `chat_stream`
+
+Example response:
+
+```json
+{
+  "events": [
+    {
+      "id": "event-id",
+      "timestamp": "2026-05-03T12:00:00+00:00",
+      "event_type": "rag_query",
+      "trace_id": "request-trace-id",
+      "model": "gemini-2.5-flash",
+      "query": "What are the risks?",
+      "prompt": "Full prompt sent to the model...",
+      "prompt_length": 2400,
+      "response_length": 900,
+      "retrieval": {
+        "requested_candidates": 8,
+        "initial_count": 8,
+        "deduped_count": 5,
+        "returned_count": 5,
+        "source_pages": [1, 2, 3],
+        "sources": [
+          {
+            "page": 1,
+            "snippet": "Retrieved source snippet..."
+          }
+        ]
+      },
+      "latency_ms": {
+        "retrieval": 830.5,
+        "llm": 2110.2,
+        "total": 2945.4
+      }
+    }
+  ]
+}
+```
+
+Use this endpoint in Lovable to build an admin/debug panel for recent retrievals, prompts, source pages, and latency.
+
+### Evaluation Variants
+
+```http
+GET /api/v1/evaluation/variants
+```
+
+Returns the available prompt variants:
+
+```json
+{
+  "variants": {
+    "baseline": {
+      "label": "Baseline Grounded JSON",
+      "description": "Current strict RAG prompt with answer, insights, risks, recommendation, and sources."
+    },
+    "concise": {
+      "label": "Concise Decision Brief",
+      "description": "Shorter decision-focused prompt emphasizing directness and minimal repetition."
+    },
+    "risk_first": {
+      "label": "Risk-First Decision Brief",
+      "description": "Prompt variant that prioritizes risks, uncertainty, and recommendation quality."
+    }
+  }
+}
+```
+
+### Prompt Comparison
+
+```http
+POST /api/v1/evaluation/prompt-comparison
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "question": "What decision should be made based on the uploaded document?",
+  "variants": ["baseline", "concise", "risk_first"]
+}
+```
+
+Example response shape:
+
+```json
+{
+  "event_type": "prompt_comparison",
+  "trace_id": "evaluation-trace-id",
+  "model": "gemini-2.5-flash",
+  "question": "What decision should be made based on the uploaded document?",
+  "retrieval": {
+    "requested_candidates": 8,
+    "initial_count": 8,
+    "deduped_count": 5,
+    "returned_count": 5,
+    "source_pages": [1, 2],
+    "latency_ms": 850.3
+  },
+  "winner": "baseline",
+  "results": [
+    {
+      "variant": "baseline",
+      "label": "Baseline Grounded JSON",
+      "description": "Current strict RAG prompt...",
+      "answer": {
+        "answer": "Document-grounded answer...",
+        "key_insights": [],
+        "risks": [],
+        "recommendation": "Recommended next step...",
+        "sources": []
+      },
+      "metrics": {
+        "groundedness_score": 0.82,
+        "citation_coverage": 0.67,
+        "valid_citations": true,
+        "overall_score": 0.76,
+        "latency_ms": 2200.4,
+        "prompt_length": 2400,
+        "response_length": 900,
+        "source_count": 3,
+        "risk_count": 2,
+        "insight_count": 3,
+        "has_recommendation": true
+      }
+    }
+  ]
+}
+```
+
+Lovable can display this as a prompt-comparison dashboard:
+
+1. Let the user enter an evaluation question.
+2. Call `POST /api/v1/evaluation/prompt-comparison`.
+3. Show the `winner`.
+4. Render one card per item in `results`.
+5. Compare `overall_score`, `groundedness_score`, `citation_coverage`, `latency_ms`, and `source_count`.
+
+### Evaluation Metrics
+
+```http
+GET /api/v1/evaluation/metrics?limit=50
+```
+
+Returns a summary of recent prompt-comparison runs:
+
+```json
+{
+  "evaluation_runs": 3,
+  "observability_events": 20,
+  "average_latency_ms": 1800.5,
+  "latest_evaluation": {},
+  "recent_evaluations": []
+}
+```
+
+### Evaluation Runs
+
+```http
+GET /api/v1/evaluation/runs?limit=20
+```
+
+Returns recent stored prompt-comparison runs.
+
 ## Lovable Frontend Integration
 
 The Lovable frontend should call the Railway backend URL.
@@ -427,28 +612,37 @@ Current behavior is optimized for one active knowledge base at a time. Uploading
 
 ## Observability
 
-The backend currently logs operational details to standard output, which Railway captures in deployment logs.
+The backend stores operational events as JSON Lines under:
+
+```text
+data/logs/observability.jsonl
+data/logs/evaluations.jsonl
+```
+
+These files are ignored by Git and remain server-side.
 
 Logged information includes:
 
 - query text
 - number of retrieved chunks
-- prompt length
+- full prompt and prompt length
 - response length
+- source pages and source snippets
+- model name
 - streaming response length
 - number of context chunks used in chat
+- upload, retrieval, LLM, streaming, and total latency
 
 Recommended production improvements:
 
-- replace `print()` with structured logging
 - include request IDs
-- record retrieval latency, embedding latency, LLM latency, and total latency
 - log retrieval scores and selected source pages
 - add error-level logs for failed Gemini calls
+- ship logs to a managed store such as Postgres, OpenTelemetry, or a log platform
 
 ## Evaluation Approach
 
-Use a small evaluation set of uploaded documents and expected questions.
+Use a small evaluation set of uploaded documents and expected questions. The backend includes prompt-comparison support through `/api/v1/evaluation/prompt-comparison`.
 
 Suggested checks:
 
@@ -457,6 +651,7 @@ Suggested checks:
 - Does the system say `Insufficient data` when the answer is not in the document?
 - Are risks and recommendations actually supported by the source?
 - Does streaming complete without malformed SSE events?
+- Which prompt variant gives the best groundedness/citation/latency balance?
 
 Example evaluation table:
 
@@ -467,7 +662,7 @@ Example evaluation table:
 | "Who is the CEO?" when absent | Refuses to guess. | Says insufficient data. |
 | "Summarize the document" | Uses multiple relevant chunks. | Includes source snippets. |
 
-Prompt comparison can be added by running the same evaluation questions against multiple prompt versions and comparing groundedness, completeness, and citation quality.
+Prompt comparison runs the same retrieved context and question through multiple prompt variants, computes groundedness/citation/quality metrics, stores the run server-side, and returns the metrics for Lovable to render.
 
 ## Assignment Requirement Mapping
 
@@ -487,7 +682,7 @@ Prompt comparison can be added by running the same evaluation questions against 
 | Streaming responses | Implemented | `/api/v1/chat/stream` uses SSE. |
 | Citation display | Frontend-dependent | Backend sends source metadata for Lovable to render. |
 | Observability | Partial | Railway/stdout logs exist; structured latency logging is future work. |
-| Evaluation | Planned | Manual evaluation approach documented; automated harness not yet implemented. |
+| Evaluation | Partial | Prompt comparison and groundedness metrics are implemented; larger fixed test sets are future work. |
 | GitHub repo | Implemented | Repository includes backend source and deployment files. |
 | README | Implemented | This file documents setup, architecture, endpoints, and tradeoffs. |
 | Demo video | External | Record using Lovable frontend and Railway backend. |
@@ -510,9 +705,9 @@ The current backend resets the vector store on each upload. This makes the behav
 
 The backend accepts history in each chat request rather than storing conversations. This works well with Lovable state, but a production system would persist conversation history server-side.
 
-### Standard output logging
+### JSONL observability
 
-Railway captures stdout logs, so simple logging is enough for development. Production observability should use structured logs and latency metrics.
+The backend stores structured JSONL events on the server so retrieval, prompts, and latency can be inspected through API endpoints. A larger production system would ship the same events to a managed database, log platform, or OpenTelemetry collector.
 
 ## Limitations
 
@@ -520,7 +715,7 @@ Railway captures stdout logs, so simple logging is enough for development. Produ
 - Uploaded documents replace the active vector index.
 - No user accounts or document ownership model.
 - No backend-persisted chat history.
-- No automated evaluation harness yet.
+- Prompt comparison is available, but there is no large fixed benchmark dataset yet.
 - No cache layer yet.
 - Retrieval uses a simple FAISS index and lightweight reranking, not a learned reranker.
 
@@ -585,7 +780,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/chat \
 - Add document IDs and support multiple document collections.
 - Add backend-persisted chat history.
 - Add structured logging and latency metrics.
-- Add automated groundedness evaluation.
+- Add a larger fixed benchmark dataset for repeatable evaluation.
 - Add authentication for private deployments.
 - Add caching for repeated questions.
 - Add stronger retrieval scoring and optional reranking.
