@@ -86,14 +86,49 @@ def get_evaluation_events(limit: int = 20) -> list[dict]:
     return read_jsonl(EVALUATION_LOG_PATH, limit=limit)
 
 
-def get_metrics_summary(limit: int = 50) -> dict:
-    eval_events = get_evaluation_events(limit=limit)
-    observability_events = get_observability_events(limit=limit)
+def summarize_evaluation_run(event: dict) -> dict:
+    results = event.get("results", [])
+    winner_result = next(
+        (
+            result for result in results
+            if result.get("variant") == event.get("winner")
+        ),
+        results[0] if results else {},
+    )
+    winner_metrics = winner_result.get("metrics", {})
 
-    completed_eval_runs = [
-        event for event in eval_events
+    return {
+        "id": event.get("id"),
+        "timestamp": event.get("timestamp"),
+        "event_type": event.get("event_type"),
+        "trace_id": event.get("trace_id"),
+        "model": event.get("model"),
+        "question": event.get("question"),
+        "winner": event.get("winner"),
+        "variant_count": len(results),
+        "retrieval": event.get("retrieval", {}),
+        "winner_metrics": {
+            "overall_score": winner_metrics.get("overall_score"),
+            "groundedness_score": winner_metrics.get("groundedness_score"),
+            "citation_coverage": winner_metrics.get("citation_coverage"),
+            "latency_ms": winner_metrics.get("latency_ms"),
+            "source_count": winner_metrics.get("source_count"),
+        },
+    }
+
+
+def get_evaluation_summaries(limit: int = 20) -> list[dict]:
+    return [
+        summarize_evaluation_run(event)
+        for event in get_evaluation_events(limit=limit)
         if event.get("event_type") == "prompt_comparison"
     ]
+
+
+def get_metrics_summary(limit: int = 50) -> dict:
+    eval_events = get_evaluation_summaries(limit=limit)
+    observability_events = get_observability_events(limit=limit)
+
     latency_values = [
         event.get("latency_ms", {}).get("total")
         for event in observability_events
@@ -105,12 +140,12 @@ def get_metrics_summary(limit: int = 50) -> dict:
     if latency_values:
         avg_latency = round(sum(latency_values) / len(latency_values), 2)
 
-    latest_eval = completed_eval_runs[-1] if completed_eval_runs else None
+    latest_eval = eval_events[-1] if eval_events else None
 
     return {
-        "evaluation_runs": len(completed_eval_runs),
+        "evaluation_runs": len(eval_events),
         "observability_events": len(observability_events),
         "average_latency_ms": avg_latency,
         "latest_evaluation": latest_eval,
-        "recent_evaluations": completed_eval_runs[-10:],
+        "recent_evaluations": eval_events[-10:],
     }

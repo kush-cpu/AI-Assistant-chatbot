@@ -18,6 +18,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 GEMINI_API_URL = os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+LOG_FULL_PROMPTS = os.getenv("LOG_FULL_PROMPTS", "false").lower() == "true"
 RETRIEVAL_CANDIDATES = 8
 CONTEXT_CHUNKS = 5
 MAX_CONTEXT_CHARS = 700
@@ -309,6 +310,13 @@ def _source_summary(chunks: list[dict]) -> list[dict]:
     ]
 
 
+def _prompt_log_fields(prompt: str) -> dict:
+    fields = {"prompt_length": len(prompt)}
+    if LOG_FULL_PROMPTS:
+        fields["prompt"] = prompt
+    return fields
+
+
 def _normalize_response(response: dict, retrieved_chunks: list[dict]) -> dict:
     response.setdefault("answer", "")
     response.setdefault("key_insights", [])
@@ -519,8 +527,7 @@ async def query_rag(query: str):
         "trace_id": trace_id,
         "model": _effective_gemini_model(),
         "query": query,
-        "prompt": prompt,
-        "prompt_length": len(prompt),
+        **_prompt_log_fields(prompt),
         "response_length": len(raw_output),
         "retrieval": retrieval_metrics,
         "latency_ms": {
@@ -565,8 +572,7 @@ async def chat_with_assistant(
         "history_count": len(history or []),
         "use_knowledge_base": use_knowledge_base,
         "used_knowledge_base": bool(retrieved_chunks),
-        "prompt": prompt,
-        "prompt_length": len(prompt),
+        **_prompt_log_fields(prompt),
         "response_length": len(answer),
         "retrieval": {
             "returned_count": len(retrieved_chunks),
@@ -629,8 +635,7 @@ def stream_chat_with_assistant(
         "history_count": len(history or []),
         "use_knowledge_base": use_knowledge_base,
         "used_knowledge_base": bool(retrieved_chunks),
-        "prompt": prompt,
-        "prompt_length": len(prompt),
+        **_prompt_log_fields(prompt),
         "response_length": response_length,
         "retrieval": {
             "returned_count": len(retrieved_chunks),

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from app.evaluation import compare_prompts, get_prompt_variants
 from app.observability import (
     get_evaluation_events,
+    get_evaluation_summaries,
     get_metrics_summary,
     get_observability_events,
 )
@@ -248,9 +249,14 @@ async def evaluation_variants():
 
 
 @router.get("/api/v1/evaluation/runs")
-async def evaluation_runs(limit: int = 20):
+async def evaluation_runs(limit: int = 20, include_results: bool = False):
+    runs = (
+        get_evaluation_events(limit=limit)
+        if include_results
+        else get_evaluation_summaries(limit=limit)
+    )
     return {
-        "runs": get_evaluation_events(limit=limit),
+        "runs": runs,
     }
 
 

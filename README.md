@@ -118,6 +118,7 @@ GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-2.5-flash
 GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 FRONTEND_ORIGINS=*
+LOG_FULL_PROMPTS=false
 ```
 
 For production, replace `FRONTEND_ORIGINS=*` with the Lovable frontend domain.
@@ -161,6 +162,7 @@ GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-2.5-flash
 GEMINI_EMBEDDING_MODEL=gemini-embedding-001
 FRONTEND_ORIGINS=https://your-lovable-app.lovable.app
+LOG_FULL_PROMPTS=false
 ```
 
 After deployment, use the Railway service URL as the backend base URL in Lovable.
@@ -382,7 +384,6 @@ Example response:
       "trace_id": "request-trace-id",
       "model": "gemini-2.5-flash",
       "query": "What are the risks?",
-      "prompt": "Full prompt sent to the model...",
       "prompt_length": 2400,
       "response_length": 900,
       "retrieval": {
@@ -408,7 +409,9 @@ Example response:
 }
 ```
 
-Use this endpoint in Lovable to build an admin/debug panel for recent retrievals, prompts, source pages, and latency.
+Use this endpoint in Lovable to build an admin/debug panel for recent retrievals, source pages, prompt length, response length, and latency.
+
+By default the backend stores `prompt_length` but not the full prompt body, keeping normal chat and streaming responses lighter. Set `LOG_FULL_PROMPTS=true` if you need full prompt text stored in observability logs for debugging.
 
 ### Evaluation Variants
 
@@ -532,7 +535,15 @@ Returns a summary of recent prompt-comparison runs:
 GET /api/v1/evaluation/runs?limit=20
 ```
 
-Returns recent stored prompt-comparison runs.
+Returns recent stored prompt-comparison run summaries. This does not call the LLM and is safe to poll from Lovable.
+
+To fetch full stored results, use:
+
+```http
+GET /api/v1/evaluation/runs?limit=20&include_results=true
+```
+
+Only call `POST /api/v1/evaluation/prompt-comparison` from an explicit user action such as a “Run Comparison” button. That endpoint intentionally calls the LLM once per selected prompt variant and will be slower than normal chat.
 
 ## Lovable Frontend Integration
 
@@ -625,7 +636,7 @@ Logged information includes:
 
 - query text
 - number of retrieved chunks
-- full prompt and prompt length
+- prompt length, and optionally full prompt when `LOG_FULL_PROMPTS=true`
 - response length
 - source pages and source snippets
 - model name
